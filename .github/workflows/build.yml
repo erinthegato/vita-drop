@@ -18,16 +18,17 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install dependencies
+      - name: Optimize PNG assets (optional)
         run: |
-          apk update
-          apk add --no-cache pngquant
-
-      - name: Optimize PNG assets
-        run: |
-          pngquant --force --ext .png 256 sce_sys/icon0.png || true
-          pngquant --force --ext .png 256 sce_sys/livearea/contents/bg.png || true
-          pngquant --force --ext .png 256 sce_sys/livearea/contents/startup.png || true
+          # The vitasdk image no longer ships apk, so don't install anything;
+          # pngquant is only an asset-size optimisation and is skipped when absent.
+          if command -v pngquant >/dev/null 2>&1; then
+            pngquant --force --ext .png 256 sce_sys/icon0.png || true
+            pngquant --force --ext .png 256 sce_sys/livearea/contents/bg.png || true
+            pngquant --force --ext .png 256 sce_sys/livearea/contents/startup.png || true
+          else
+            echo "pngquant not available, keeping original PNGs"
+          fi
 
       - name: Build VPK
         run: |

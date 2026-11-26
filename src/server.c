@@ -21,6 +21,7 @@
 
 #define MAX_CONNECTIONS 5
 #define RECV_BUF_SIZE 262144 // 256 KB chunks
+#define REQUEST_IDLE_TIMEOUT_US (5 * 1000 * 1000) // 5 s to send request headers
 
 TransferStatus g_transfer = {
     .state = TRANSFER_IDLE,
@@ -39,11 +40,16 @@ static char local_ip[16] = "0.0.0.0";
 /* ============================================================
  * HTTP Response Templates
  * ============================================================ */
-static const char *http_200_html =
-    "HTTP/1.1 200 OK\r\n"
-    "Content-Type: text/html\r\n"
-    "Connection: close\r\n"
-    "\r\n";
+/* Send a whole buffer, retrying on partial sends (sceNetSend may accept
+ * only part of a large block). */
+static void send_all(int sock, const char *data, int len) {
+    int sent = 0;
+    while (sent < len) {
+        int n = sceNetSend(sock, data + sent, len - sent, 0);
+        if (n <= 0) break;
+        sent += n;
+    }
+}
 
 static const char *http_200_json =
     "HTTP/1.1 200 OK\r\n"
@@ -301,8 +307,8 @@ static void handle_api_ls(int client_sock, const char *path) {
         "Connection: close\r\n"
         "\r\n", pos);
 
-    sceNetSend(client_sock, header, strlen(header), 0);
-    sceNetSend(client_sock, json, pos, 0);
+    send_all(client_sock, header, (int)strlen(header));
+    send_all(client_sock, json, pos);
     free(json);
 }
 
@@ -536,21 +542,36 @@ static void handle_client(int client_sock) {
         return;
     }
 
-    // Read HTTP headers
+    // Read HTTP headers. The socket is non-blocking here, so a peer that opens a
+    // connection and never sends a request (browser preconnect, dropped Wi-Fi)
+    // is dropped after REQUEST_IDLE_TIMEOUT_US instead of blocking the server.
     int header_len = 0;
+    uint32_t deadline = sceKernelGetProcessTimeLow() + REQUEST_IDLE_TIMEOUT_US;
     while (header_len < 4095) {
-        int r = sceNetRecv(client_sock, header_buf + header_len, 1, 0);
-        if (r <= 0) break;
-        header_len++;
-        header_buf[header_len] = '\0';
-        if (strstr(header_buf, "\r\n\r\n")) break;
+        if ((int32_t)(sceKernelGetProcessTimeLow() - deadline) > 0) break;
+
+        int r = sceNetRecv(client_sock, header_buf + header_len, 4095 - header_len, 0);
+        if (r > 0) {
+            header_len += r;
+            header_buf[header_len] = '\0';
+            if (strstr(header_buf, "\r\n\r\n")) break;
+            deadline = sceKernelGetProcessTimeLow() + REQUEST_IDLE_TIMEOUT_US;
+        } else if (r == 0) {
+            break; // peer closed
+        } else {
+            sceKernelDelayThread(2 * 1000);
+        }
     }
 
-    if (header_len == 0) {
+    if (header_len <= 0 || !strstr(header_buf, "\r\n\r\n")) {
         free(header_buf);
         sceNetSocketClose(client_sock);
         return;
     }
+
+    // Back to blocking for the request body and the response.
+    int block = 0;
+    sceNetSetsockopt(client_sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &block, sizeof(block));
 
     // Parse request line
     char method[8], req_path[256], req_query[1024];
@@ -559,9 +580,19 @@ static void handle_client(int client_sock) {
 
     if (strcmp(method, "GET") == 0) {
         if (strcmp(req_path, "/") == 0 || strcmp(req_path, "/index.html") == 0) {
-            // Serve frontend
-            sceNetSend(client_sock, http_200_html, strlen(http_200_html), 0);
-            sceNetSend(client_sock, frontend_html, strlen(frontend_html), 0);
+            // Serve frontend. An explicit Content-Length keeps browsers from
+            // waiting on the connection to close, and send_all guarantees the
+            // page never arrives truncated.
+            int page_len = (int)strlen(frontend_html);
+            char page_header[192];
+            snprintf(page_header, sizeof(page_header),
+                "HTTP/1.1 200 OK\r\n"
+                "Content-Type: text/html; charset=utf-8\r\n"
+                "Content-Length: %d\r\n"
+                "Connection: close\r\n"
+                "\r\n", page_len);
+            send_all(client_sock, page_header, (int)strlen(page_header));
+            send_all(client_sock, frontend_html, page_len);
         }
         else if (strcmp(req_path, "/api/ls") == 0) {
             char path[512];
@@ -757,6 +788,17 @@ int server_init(int port) {
     return 0;
 }
 
+/* One thread per connection, so a slow or stalled request cannot hold up the
+ * others (browsers open several connections at once, and a single serial
+ * handler made the web UI hang until the page was refreshed). */
+static int client_thread(SceSize args, void *argp) {
+    (void)args;
+    int client_sock = *(int *)argp;
+    handle_client(client_sock);
+    sceKernelExitDeleteThread(0);
+    return 0;
+}
+
 void server_run(void) {
     while (server_running) {
         SceNetSockaddrIn client_addr;
@@ -765,7 +807,8 @@ void server_run(void) {
         int client_sock = sceNetAccept(server_socket, (SceNetSockaddr *)&client_addr, &addr_len);
 
         if (client_sock >= 0) {
-            int opt = 0;
+            // Non-blocking until the request headers are in (see handle_client).
+            int opt = 1;
             sceNetSetsockopt(client_sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &opt, sizeof(opt));
 
             int rcv_opt = 262144;
@@ -774,7 +817,13 @@ void server_run(void) {
             int nodelay = 1;
             sceNetSetsockopt(client_sock, SCE_NET_IPPROTO_TCP, SCE_NET_TCP_NODELAY, &nodelay, sizeof(nodelay));
 
-            handle_client(client_sock);
+            int sock_arg = client_sock;
+            SceUID thid = sceKernelCreateThread("VitaDropClient", client_thread,
+                                                0x10000100, 0x10000, 0, 0, NULL);
+            if (thid < 0 || sceKernelStartThread(thid, sizeof(sock_arg), &sock_arg) < 0) {
+                if (thid >= 0) sceKernelDeleteThread(thid);
+                handle_client(client_sock); // fallback: serve inline
+            }
         } else {
             sceKernelDelayThread(10 * 1000);
         }
